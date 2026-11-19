@@ -13,9 +13,9 @@
 #
 #  Pemakaian (pin ke tag/commit, jangan ke branch main):
 #    Laporan saja (tidak mengubah apa pun; sudo agar config & Docker terbaca):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.2/php-nginx-2026-11.sh | sudo bash -s -- --check
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.3.0/php-nginx-2026-11.sh | sudo bash -s -- --check
 #    Interaktif (menu):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.2/php-nginx-2026-11.sh | sudo bash
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.3.0/php-nginx-2026-11.sh | sudo bash
 #    Non-interaktif:
 #      ... | sudo bash -s -- --update --mitigate --yes
 #
@@ -25,6 +25,8 @@
 #    --mitigate          Mitigasi PHP (session.upload_progress.enabled = Off)
 #    --nginx-no-http2    Mitigasi nginx: matikan HTTP/2 (hanya bila diminta)
 #    --all               --update + --mitigate (HTTP/2 tidak disentuh)
+#    --system-upgrade    Update & upgrade SEMUA paket sistem (apt update && apt upgrade
+#                        / dnf upgrade). Tidak menghapus paket; config lama dipertahankan.
 #    --skip-php          Lewati semua bagian PHP
 #    --skip-nginx        Lewati semua bagian nginx
 #    --skip-containers   Jangan memeriksa container Docker/Podman
@@ -39,7 +41,7 @@
 #  nginx divalidasi dengan "nginx -t" dan dikembalikan bila gagal.
 # =============================================================================
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_NAME="server-patch-kit · php-nginx-2026-11"
 
 # ---- Acuan PHP (perbarui saat ada rilis baru) --------------------------------
@@ -65,7 +67,8 @@ START_HUMAN="$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%:z)')"
 # oleh pola seperti "include sites-enabled/*;" di nginx.
 BACKUP_DIR="/var/backups/php-patch-check/${TS}-$$"
 ASSUME_YES=0; DO_RESTART=1; FROM_FLAG=0; SKIP_PHP=0; SKIP_NGX=0; SKIP_CTR=0; CHECK_ONLY=0; CTR_DENIED=0
-A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0
+A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; A_SYS=0
+php_upd=(); php_mit=(); ngx_vul=(); ctr_vul=0
 PKG=""; HAS_TTY=0
 declare -a E_BRANCH=() E_FULL=() E_UP=() E_KIND=() E_BIN=() E_ORIGIN=() E_STATUS=()
 declare -a X_BIN=() X_FULL=() X_UP=() X_KIND=() X_ORIGIN=() X_STATUS=() X_PKG=() X_CONF=() X_FEAT=()
@@ -88,7 +91,7 @@ err()  { printf '%s\n' "  ${R}✘${N} $*" >&2; }
 usage() {
   cat <<'EOF'
 server-patch-kit php-nginx-2026-11: cek PHP & nginx (host + container) terhadap advisory terbaru.
-  --check  --update  --mitigate  --nginx-no-http2  --all
+  --check  --update  --mitigate  --nginx-no-http2  --all  --system-upgrade
   --skip-php  --skip-nginx  --skip-containers  --yes  --no-restart  -h|--help
 Contoh: curl -fsSL <URL> | sudo bash -s -- --update --mitigate --yes
 EOF
@@ -754,6 +757,104 @@ choose() { # $1 = php|ngx, sisanya indeks kandidat
   done
 }
 
+# Hitung ulang daftar kandidat aksi dari status terkini.
+compute_candidates() {
+  local i
+  php_upd=(); php_mit=(); ngx_vul=(); ctr_vul=0
+  for i in "${!E_BRANCH[@]}"; do
+    if [ -n "${E_CTR[$i]}" ]; then
+      case "${E_STATUS[$i]}" in VULNERABLE|EOL) ctr_vul=1 ;; esac
+      continue
+    fi
+    case "${E_STATUS[$i]}" in
+      VULNERABLE) php_upd+=("$i"); php_mit+=("$i") ;;
+      EOL)        php_mit+=("$i"); [ "${E_ORIGIN[$i]}" = "repo distro" ] && php_upd+=("$i") ;;
+    esac
+  done
+  for i in "${!X_BIN[@]}"; do
+    [ "${X_STATUS[$i]}" = PATCHED ] && continue
+    if [ -n "${X_CTR[$i]}" ]; then ctr_vul=1; else ngx_vul+=("$i"); fi
+  done
+}
+
+# Baca ulang versi PHP/nginx di host; antrikan restart bila versinya berubah.
+refresh_host() {
+  local i up full nu
+  for i in "${!E_BRANCH[@]}"; do
+    [ -n "${E_CTR[$i]}" ] && continue
+    full="$("${E_BIN[$i]}" -v 2>/dev/null | head -n1 | awk '{print $2}')"
+    up="$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$full")" || continue
+    if [ "$full" != "${E_FULL[$i]}" ]; then
+      ok "PHP ${E_BRANCH[$i]}: ${E_FULL[$i]} → $full"
+      E_FULL[$i]="$full"; E_UP[$i]="$up"
+      queue_restart_php "${E_BRANCH[$i]}" "${E_KIND[$i]}"
+    fi
+    E_STATUS[$i]="$(php_status "$up" "${E_BRANCH[$i]}")"
+  done
+  for i in "${!X_BIN[@]}"; do
+    [ -n "${X_CTR[$i]}" ] && continue
+    nu="$("${X_BIN[$i]}" -v 2>&1 | grep -oE '/[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | tr -d /)"
+    [ -n "$nu" ] || continue
+    if [ "$nu" != "${X_UP[$i]}" ]; then
+      ok "nginx: ${X_UP[$i]} → $nu"
+      X_UP[$i]="$nu"
+      if "${X_BIN[$i]}" -t >/dev/null 2>&1; then RESTART_SET["nginx"]=1
+      else err "nginx -t GAGAL setelah upgrade; nginx tidak akan di-restart. Periksa: ${X_BIN[$i]} -t"; fi
+    fi
+    [ "${X_STATUS[$i]}" != PLUS ] && X_STATUS[$i]="$(ngx_status "$nu" 0)"
+  done
+}
+
+# Update & upgrade semua paket sistem (apt update && apt upgrade / dnf upgrade).
+# "apt upgrade" tidak pernah menghapus paket; file konfigurasi yang ada dipertahankan.
+sys_upgrade() {
+  local plan n rc kept
+  info "Update & upgrade paket sistem"
+  case "$PKG" in
+    apt)
+      apt-get update || { err "apt-get update gagal"; return 1; }
+      plan="$(apt-get -s upgrade 2>/dev/null)"
+      n="$(grep -c '^Inst ' <<<"$plan")"
+      kept="$(awk '/kept back:/{f=1;next} f&&/^  /{printf "%s ",$0;next} {f=0}' <<<"$plan" | xargs)"
+      if [ "$n" -eq 0 ]; then
+        ok "Semua paket sudah versi terbaru."
+        [ -n "$kept" ] && warn "Ditahan (butuh perubahan dependensi, tidak ikut upgrade): $kept"
+        return 0
+      fi
+      echo "  $n paket akan di-upgrade:"
+      grep '^Inst ' <<<"$plan" | awk '{gsub(/[][]/,"",$3); gsub(/\(/,"",$4); printf "    %-32s %s → %s\n",$2,$3,$4}' | head -n 40
+      [ "$n" -gt 40 ] && echo "    ... dan $((n-40)) paket lainnya"
+      [ -n "$kept" ] && warn "Ditahan (tidak ikut upgrade): $kept"
+      if grep -Eq '^Inst (docker-ce|docker-ce-cli|docker\.io|containerd|containerd\.io|runc|moby-[a-z-]+) ' <<<"$plan"; then
+        warn "Docker/containerd ikut di-upgrade: daemon Docker akan restart dan SEMUA container"
+        warn "berhenti sebentar (service Swarm dijadwalkan ulang). Jalankan di luar jam sibuk."
+      fi
+      ask_yn "Jalankan apt upgrade untuk $n paket?" || { warn "Dibatalkan."; return 3; }
+      DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1 apt-get -y \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+      rc=$?
+      ;;
+    dnf|yum)
+      echo "  Pratinjau:"
+      "$PKG" -q check-update | sed 's/^/    /'
+      [ "${PIPESTATUS[0]}" -eq 100 ] || { ok "Semua paket sudah versi terbaru."; return 0; }
+      ask_yn "Jalankan $PKG upgrade untuk paket di atas?" || { warn "Dibatalkan."; return 3; }
+      "$PKG" upgrade -y; rc=$?
+      ;;
+    *) warn "Package manager tidak dikenali; dilewati."; return 3 ;;
+  esac
+  if [ "$rc" -ne 0 ]; then err "Upgrade sistem gagal (kode $rc). Tidak ada paket yang dihapus; cek output di atas."; return 1; fi
+  ok "Upgrade sistem selesai."
+  if [ -f /var/run/reboot-required ]; then
+    warn "Server perlu REBOOT (kernel/library inti diperbarui): $(tr '\n' ' ' </var/run/reboot-required.pkgs 2>/dev/null)"
+  elif command -v needs-restarting >/dev/null 2>&1 && ! needs-restarting -r >/dev/null 2>&1; then
+    warn "Server perlu REBOOT (needs-restarting -r)."
+  fi
+  command -v needrestart >/dev/null 2>&1 && \
+    warn "Layanan lain yang mungkin perlu restart: sudo needrestart -r l"
+  return 0
+}
+
 finish_line() {
   local dur=$(( $(date +%s) - START_EPOCH ))
   printf '\n%s\n' "${D}Selesai   : $(date '+%Y-%m-%d %H:%M:%S %Z') (durasi ${dur} detik)${N}"
@@ -769,6 +870,7 @@ main() {
       --mitigate)       A_PHP_MIT=1; FROM_FLAG=1 ;;
       --nginx-no-http2) A_NGX_H2=1; FROM_FLAG=1 ;;
       --all)            A_PHP_UPD=1; A_NGX_UPD=1; A_PHP_MIT=1; FROM_FLAG=1 ;;
+      --system-upgrade|--apt-upgrade) A_SYS=1; FROM_FLAG=1 ;;
       --skip-php)       SKIP_PHP=1 ;;
       --skip-nginx)     SKIP_NGX=1 ;;
       --skip-containers) SKIP_CTR=1 ;;
@@ -779,7 +881,7 @@ main() {
     esac
     shift
   done
-  [ "$CHECK_ONLY" -eq 1 ] && { A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; }
+  [ "$CHECK_ONLY" -eq 1 ] && { A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; A_SYS=0; }
 
   printf '%s\n' "${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N} ${D}— PHP ${PHP_RELEASE_DATE} · nginx ${NGX_ADVISORY}${N}"
   printf '%s\n\n' "${D}Waktu cek : ${START_HUMAN}  ·  host: $(hostname 2>/dev/null || uname -n)${N}"
@@ -792,60 +894,55 @@ main() {
   [ "$SKIP_PHP" -eq 0 ] && php_report
   [ "$SKIP_NGX" -eq 0 ] && ngx_report
 
-  local i php_upd=() php_mit=() ngx_vul=() ctr_vul=0
-  if [ $(( ${#E_BRANCH[@]} + ${#X_BIN[@]} )) -eq 0 ]; then
+  local i tok
+  compute_candidates
+  local found=$(( ${#E_BRANCH[@]} + ${#X_BIN[@]} ))
+  local host_vul=$(( ${#php_mit[@]} + ${#ngx_vul[@]} ))
+
+  if [ "$found" -eq 0 ]; then
     warn "Tidak ada PHP maupun nginx yang bisa dicek (di host maupun container)."
     [ "$CTR_DENIED" -eq 1 ] && warn "Container belum terbaca: ulangi dengan \"| sudo bash\"."
     warn "Jika proxy memakai software lain (Caddy, Traefik, HAProxy), script ini tidak mencakupnya."
-    exit 0
-  fi
-  for i in "${!E_BRANCH[@]}"; do
-    if [ -n "${E_CTR[$i]}" ]; then
-      case "${E_STATUS[$i]}" in VULNERABLE|EOL) ctr_vul=1 ;; esac
-      continue
-    fi
-    case "${E_STATUS[$i]}" in
-      VULNERABLE) php_upd+=("$i"); php_mit+=("$i") ;;
-      EOL)        php_mit+=("$i"); [ "${E_ORIGIN[$i]}" = "repo distro" ] && php_upd+=("$i") ;;
-    esac
-  done
-  for i in "${!X_BIN[@]}"; do
-    [ "${X_STATUS[$i]}" = PATCHED ] && continue
-    if [ -n "${X_CTR[$i]}" ]; then ctr_vul=1; else ngx_vul+=("$i"); fi
-  done
-
-  if [ "${#php_mit[@]}" -eq 0 ] && [ "${#ngx_vul[@]}" -eq 0 ]; then
-    if [ "$ctr_vul" -eq 1 ]; then
-      ctr_advice; exit 1
-    fi
+  elif [ "$host_vul" -eq 0 ] && [ "$ctr_vul" -eq 0 ]; then
     ok "Semua PHP dan nginx yang terdeteksi sudah berisi patch terbaru."
     [ "$CTR_DENIED" -eq 1 ] && warn "Container belum terbaca: ulangi dengan \"| sudo bash\" untuk hasil lengkap."
-    exit 0
   fi
 
   # Menu interaktif bila tidak ada aksi dari flag
   if [ "$CHECK_ONLY" -eq 0 ] && [ "$FROM_FLAG" -eq 0 ]; then
     if [ "$HAS_TTY" -eq 1 ]; then
+      echo
       echo "Pilih aksi (boleh lebih dari satu, pisahkan spasi):"
       [ "${#php_upd[@]}" -gt 0 ] && echo "  1) Update PHP yang belum di-patch"
       [ "${#php_mit[@]}" -gt 0 ] && echo "  2) Mitigasi PHP (session.upload_progress.enabled = Off)"
       [ "${#ngx_vul[@]}" -gt 0 ] && echo "  3) Update nginx"
       [ "${#ngx_vul[@]}" -gt 0 ] && echo "  4) Mitigasi nginx: matikan HTTP/2 (menutup 2 dari 5 CVE)"
+      [ -n "$PKG" ] && echo "  5) Update & upgrade SEMUA paket sistem ($PKG update && $PKG upgrade)"
       echo "  0) Keluar (hanya laporan)"
-      local tok
       for tok in $(ask_line "Pilihan [0]: "); do
-        case "$tok" in 1) A_PHP_UPD=1 ;; 2) A_PHP_MIT=1 ;; 3) A_NGX_UPD=1 ;; 4) A_NGX_H2=1 ;; esac
+        case "$tok" in 1) A_PHP_UPD=1 ;; 2) A_PHP_MIT=1 ;; 3) A_NGX_UPD=1 ;; 4) A_NGX_H2=1 ;; 5) A_SYS=1 ;; esac
       done
-    else
+    elif [ "$host_vul" -gt 0 ]; then
       warn "Tidak ada terminal interaktif: hanya laporan. Gunakan --update/--mitigate dengan --yes."
     fi
   fi
 
-  local any=$((A_PHP_UPD + A_PHP_MIT + A_NGX_UPD + A_NGX_H2))
-  if [ "$any" -gt 0 ]; then
-    [ "$(id -u)" -eq 0 ] || { err "Aksi perubahan butuh root. Jalankan: ... | sudo bash"; exit 2; }
-    [ "$HAS_TTY" -ne 1 ] && [ "$ASSUME_YES" -ne 1 ] && \
-      warn "Tanpa terminal, konfirmasi otomatis ditolak. Tambahkan --yes untuk menjalankan aksi."
+  local any=$((A_PHP_UPD + A_PHP_MIT + A_NGX_UPD + A_NGX_H2 + A_SYS))
+  if [ "$any" -eq 0 ]; then
+    [ "${#ngx_vul[@]}" -gt 0 ] && ngx_advice
+    ctr_advice
+    if [ "$host_vul" -gt 0 ] || [ "$ctr_vul" -eq 1 ]; then exit 1; fi
+    exit 0
+  fi
+  [ "$(id -u)" -eq 0 ] || { err "Aksi perubahan butuh root. Jalankan: ... | sudo bash"; exit 2; }
+  [ "$HAS_TTY" -ne 1 ] && [ "$ASSUME_YES" -ne 1 ] && \
+    warn "Tanpa terminal, konfirmasi otomatis ditolak. Tambahkan --yes untuk menjalankan aksi."
+
+  # 0) Upgrade seluruh sistem lebih dulu; aksi berikutnya memakai status terbaru
+  if [ "$A_SYS" -eq 1 ]; then
+    echo; sys_upgrade
+    echo; refresh_host
+    compute_candidates
   fi
 
   # 1) Update PHP
