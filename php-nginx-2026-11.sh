@@ -13,9 +13,9 @@
 #
 #  Pemakaian (pin ke tag/commit, jangan ke branch main):
 #    Laporan saja (tidak mengubah apa pun; sudo agar config & Docker terbaca):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.0/php-nginx-2026-11.sh | sudo bash -s -- --check
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.2/php-nginx-2026-11.sh | sudo bash -s -- --check
 #    Interaktif (menu):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.0/php-nginx-2026-11.sh | sudo bash
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.2/php-nginx-2026-11.sh | sudo bash
 #    Non-interaktif:
 #      ... | sudo bash -s -- --update --mitigate --yes
 #
@@ -39,7 +39,7 @@
 #  nginx divalidasi dengan "nginx -t" dan dikembalikan bila gagal.
 # =============================================================================
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.2"
 SCRIPT_NAME="server-patch-kit · php-nginx-2026-11"
 
 # ---- Acuan PHP (perbarui saat ada rilis baru) --------------------------------
@@ -59,6 +59,8 @@ NGX_FIX_MAINLINE="1.31.9"   # cabang mainline 1.31.x (dan semua versi di atasnya
 NGX_PLUS_FIX="37.0.8.1 / 37.3.0.1"
 
 TS="$(date +%Y%m%d-%H%M%S)"
+START_EPOCH="$(date +%s)"
+START_HUMAN="$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%:z)')"
 # Backup disimpan di luar direktori konfigurasi, supaya tidak ikut ter-include
 # oleh pola seperti "include sites-enabled/*;" di nginx.
 BACKUP_DIR="/var/backups/php-patch-check/${TS}-$$"
@@ -154,6 +156,23 @@ backup_file() { # $1 = file; salin ke BACKUP_DIR dengan path lengkap
   mkdir -p "$(dirname "$dst")" && cp -pL "$1" "$dst"
 }
 
+# Asal paket .deb: hanya "repo distro" bila versinya memang build Ubuntu/Debian.
+# Selain itu, sumber repo dibaca dari "apt-cache policy" (hanya baca).
+deb_origin() { # paket
+  local v src host
+  v="$(dpkg-query -W -f='${Version}' "$1" 2>/dev/null)"
+  [ -n "$v" ] || { echo "-"; return; }
+  if [[ "$v" == *sury* ]]; then echo "ondrej/sury"; return; fi
+  if [[ "$v" =~ ubuntu[0-9] || "$v" =~ \+deb[0-9]+u ]]; then echo "repo distro"; return; fi
+  src="$(apt-cache policy "$1" 2>/dev/null | awk '/\*\*\*/{getline; print $2; exit}')"
+  case "$src" in
+    *ondrej*)            echo "ondrej/sury" ;;
+    *nginx.org*)         echo "nginx.org" ;;
+    ""|/var/lib/dpkg/*)  echo "lokal/manual" ;;
+    *) host="${src#*://}"; host="${host%%/*}"; echo "${host:0:17}" ;;
+  esac
+}
+
 deb_installed() { # pola paket → nama paket berstatus ii
   dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' "$@" 2>/dev/null | awk '$1 ~ /^ii/ {print $2}'
 }
@@ -164,8 +183,7 @@ deb_installed() { # pola paket → nama paket berstatus ii
 php_origin() { # kind branch realpath
   local v=""
   case "$1" in
-    deb) v="$(dpkg-query -W -f='${Version}' "php$2-common" 2>/dev/null)"
-         if [[ "$v" == *sury* ]]; then echo "ondrej/sury"; elif [ -n "$v" ]; then echo "repo distro"; else echo "-"; fi ;;
+    deb) deb_origin "php$2-common" ;;
     rpm) v="$(rpm -qf --qf '%{RELEASE}' "$3" 2>/dev/null)"
          if [[ "$v" == *remi* ]]; then echo "remi"; elif [ -n "$v" ]; then echo "repo distro"; else echo "-"; fi ;;
     remi)   echo "remi (SCL)" ;;
@@ -418,11 +436,7 @@ ngx_origin_pkg() { # kind realpath → "origin|package"
   case "$1" in
     deb)
       p="$(dpkg-query -S "$2" 2>/dev/null | head -n1 | cut -d: -f1)"
-      [ -n "$p" ] && v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
-      if   [[ "$v" == *sury* ]]; then o="ondrej/sury"
-      elif [[ "$v" == *ubuntu* || "$v" == *deb* ]]; then o="repo distro"
-      elif [[ "$v" == *~* ]]; then o="nginx.org"
-      elif [ -n "$v" ]; then o="paket deb"; fi ;;
+      [ -n "$p" ] && o="$(deb_origin "$p")" ;;
     rpm)
       p="$(rpm -qf --qf '%{NAME}' "$2" 2>/dev/null)"; v="$(rpm -qf --qf '%{RELEASE}' "$2" 2>/dev/null)"
       if   [[ "$p" == ea-* ]]; then o="cPanel EA"
@@ -740,6 +754,11 @@ choose() { # $1 = php|ngx, sisanya indeks kandidat
   done
 }
 
+finish_line() {
+  local dur=$(( $(date +%s) - START_EPOCH ))
+  printf '\n%s\n' "${D}Selesai   : $(date '+%Y-%m-%d %H:%M:%S %Z') (durasi ${dur} detik)${N}"
+}
+
 # --------------------------------------------------------------- main --------
 main() {
   set -o pipefail
@@ -762,7 +781,9 @@ main() {
   done
   [ "$CHECK_ONLY" -eq 1 ] && { A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; }
 
-  printf '%s\n\n' "${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N} ${D}— PHP ${PHP_RELEASE_DATE} · nginx ${NGX_ADVISORY}${N}"
+  printf '%s\n' "${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N} ${D}— PHP ${PHP_RELEASE_DATE} · nginx ${NGX_ADVISORY}${N}"
+  printf '%s\n\n' "${D}Waktu cek : ${START_HUMAN}  ·  host: $(hostname 2>/dev/null || uname -n)${N}"
+  trap 'finish_line' EXIT
   [ "$(uname -s)" = Linux ] || { err "Script ini hanya untuk Linux."; exit 2; }
   detect_tty; detect_pkg
   [ "$SKIP_PHP" -eq 0 ] && php_discover
