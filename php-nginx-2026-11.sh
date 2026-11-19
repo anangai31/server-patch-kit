@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php-patch-check.sh  (PHP + nginx)
+#  php-nginx-2026-11.sh  (PHP + nginx, host & container Docker/Podman)
+#  Repo: https://github.com/anangai31/server-patch-kit
 #  - Mengecek semua versi PHP (multi-versi) terhadap rilis keamanan PHP
 #    19 Nov 2026, update opsional, dan mitigasi sementara untuk versi EOL.
 #  - Mengecek nginx terhadap advisory 18 Nov 2026 ("nginx2root",
 #    CVE-2026-123007/-123633/-123634/-121810/-113425; fix: 1.30.7 / 1.31.9),
 #    termasuk fitur konfigurasi mana yang membuat server terpapar.
+#  - Container Docker/Podman yang berjalan ikut dicek (HANYA BACA). Update
+#    dan mitigasi untuk container tidak dilakukan otomatis; script memberi
+#    langkah yang perlu Anda jalankan (pull image + buat ulang container).
 #
 #  Pemakaian (pin ke tag/commit, jangan ke branch main):
-#    Laporan saja (tanpa root, tidak mengubah apa pun):
-#      curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.1.0/php-patch-check.sh | bash
+#    Laporan saja (tidak mengubah apa pun; sudo agar config & Docker terbaca):
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.0/php-nginx-2026-11.sh | sudo bash -s -- --check
 #    Interaktif (menu):
-#      curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.1.0/php-patch-check.sh | sudo bash
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.2.0/php-nginx-2026-11.sh | sudo bash
 #    Non-interaktif:
 #      ... | sudo bash -s -- --update --mitigate --yes
 #
@@ -23,6 +27,7 @@
 #    --all               --update + --mitigate (HTTP/2 tidak disentuh)
 #    --skip-php          Lewati semua bagian PHP
 #    --skip-nginx        Lewati semua bagian nginx
+#    --skip-containers   Jangan memeriksa container Docker/Podman
 #    --yes               Jawab "ya" untuk semua konfirmasi
 #    --no-restart        Jangan restart PHP-FPM / web server
 #    -h, --help          Bantuan
@@ -34,7 +39,8 @@
 #  nginx divalidasi dengan "nginx -t" dan dikembalikan bila gagal.
 # =============================================================================
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
+SCRIPT_NAME="server-patch-kit · php-nginx-2026-11"
 
 # ---- Acuan PHP (perbarui saat ada rilis baru) --------------------------------
 PHP_RELEASE_DATE="19 Nov 2026"
@@ -56,11 +62,13 @@ TS="$(date +%Y%m%d-%H%M%S)"
 # Backup disimpan di luar direktori konfigurasi, supaya tidak ikut ter-include
 # oleh pola seperti "include sites-enabled/*;" di nginx.
 BACKUP_DIR="/var/backups/php-patch-check/${TS}-$$"
-ASSUME_YES=0; DO_RESTART=1; FROM_FLAG=0; SKIP_PHP=0; SKIP_NGX=0; CHECK_ONLY=0
+ASSUME_YES=0; DO_RESTART=1; FROM_FLAG=0; SKIP_PHP=0; SKIP_NGX=0; SKIP_CTR=0; CHECK_ONLY=0; CTR_DENIED=0
 A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0
 PKG=""; HAS_TTY=0
 declare -a E_BRANCH=() E_FULL=() E_UP=() E_KIND=() E_BIN=() E_ORIGIN=() E_STATUS=()
 declare -a X_BIN=() X_FULL=() X_UP=() X_KIND=() X_ORIGIN=() X_STATUS=() X_PKG=() X_CONF=() X_FEAT=()
+# Info container per entri (kosong = instalasi di host)
+declare -a E_CTR=() E_RT=() E_IMG=() E_WD=() X_CTR=() X_RT=() X_IMG=() X_WD=()
 declare -A RESTART_SET=()
 CHOSEN=()
 
@@ -77,9 +85,9 @@ err()  { printf '%s\n' "  ${R}✘${N} $*" >&2; }
 
 usage() {
   cat <<'EOF'
-php-patch-check: cek PHP (multi-versi) & nginx terhadap advisory keamanan terbaru.
+server-patch-kit php-nginx-2026-11: cek PHP & nginx (host + container) terhadap advisory terbaru.
   --check  --update  --mitigate  --nginx-no-http2  --all
-  --skip-php  --skip-nginx  --yes  --no-restart  -h|--help
+  --skip-php  --skip-nginx  --skip-containers  --yes  --no-restart  -h|--help
 Contoh: curl -fsSL <URL> | sudo bash -s -- --update --mitigate --yes
 EOF
 }
@@ -205,6 +213,7 @@ php_discover() {
     E_BRANCH+=("$branch"); E_FULL+=("$full"); E_UP+=("$up"); E_KIND+=("$kind"); E_BIN+=("$b")
     E_ORIGIN+=("$(php_origin "$kind" "$branch" "$real")")
     E_STATUS+=("$(php_status "$up" "$branch")")
+    E_CTR+=(""); E_RT+=(""); E_IMG+=(""); E_WD+=("")
   done
 }
 
@@ -479,6 +488,7 @@ ngx_discover() {
     X_ORIGIN+=("${op%%|*}"); X_PKG+=("${op#*|}")
     X_STATUS+=("$(ngx_status "$up" "$plus")")
     X_FEAT+=("$(ngx_features "$(ngx_conf_dump "$b")")")
+    X_CTR+=(""); X_RT+=(""); X_IMG+=(""); X_WD+=("")
   done
 }
 
@@ -588,6 +598,124 @@ ngx_advice() {
   done
 }
 
+# =============================================================================
+#                          CONTAINER (Docker / Podman)
+# =============================================================================
+# Semua perintah di sini hanya membaca: "ps", "inspect", dan "exec <biner> -v/-T".
+cexec() { # runtime id cmd... ; stdin ditutup agar tidak "memakan" input script
+  timeout 20 "$1" exec "$2" "${@:3}" </dev/null 2>&1
+}
+
+ctr_discover() {
+  local rt out id name image wd cmd line up full prod plus feat
+  for rt in docker podman; do
+    command -v "$rt" >/dev/null 2>&1 || continue
+    if ! out="$("$rt" ps --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null </dev/null)"; then
+      CTR_DENIED=1; warn "$rt terpasang tapi daftar container tidak bisa dibaca (jalankan dengan sudo)."
+      continue
+    fi
+    [ "$rt" = podman ] && [ -n "$(command -v docker 2>/dev/null)" ] &&       readlink -f "$(command -v docker)" | grep -q podman && continue   # docker = alias podman
+    while IFS='|' read -r id name image; do
+      [ -n "$id" ] || continue
+      wd="$("$rt" inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null </dev/null)"
+      [ "$wd" = "<no value>" ] && wd=""
+
+      # --- nginx / OpenResty
+      if [ "$SKIP_NGX" -eq 0 ]; then
+        line=""
+        for cmd in nginx openresty /usr/local/openresty/nginx/sbin/nginx; do
+          line="$(cexec "$rt" "$id" "$cmd" -v | grep -m1 'version:')" && break
+          line=""
+        done
+        if [ -n "$line" ]; then
+          prod="$(sed -E 's/.*version:[[:space:]]*([^/]+)\/.*/\1/' <<<"$line")"
+          up="$(grep -oE '/[0-9]+\.[0-9]+\.[0-9]+' <<<"$line" | head -n1 | tr -d /)"
+          if [ -n "$up" ]; then
+            plus=0; [[ "$line" == *nginx-plus* ]] && plus=1
+            feat="$(ngx_features "$(cexec "$rt" "$id" "$cmd" -T | sed 's/#.*$//')")"
+            X_BIN+=("$rt: $name ($image)"); X_UP+=("$up")
+            if [ "$prod" = openresty ]; then X_KIND+=("container-openresty"); else X_KIND+=("container"); fi
+            X_FULL+=("$(sed -E 's/.*version:[[:space:]]*//' <<<"$line")")
+            X_ORIGIN+=("$rt"); X_PKG+=("")
+            X_STATUS+=("$(ngx_status "$up" "$plus")"); X_FEAT+=("$feat")
+            X_CTR+=("$id"); X_RT+=("$rt"); X_IMG+=("$image"); X_WD+=("$wd")
+          fi
+        fi
+      fi
+
+      # --- PHP (php, php-fpm, dan php-fpmX.Y gaya Debian)
+      if [ "$SKIP_PHP" -eq 0 ]; then
+        declare -A seenv=()
+        local cmds=(php php-fpm)
+        mapfile -t -O 2 cmds < <(cexec "$rt" "$id" sh -c 'ls /usr/sbin/php-fpm[0-9]* /usr/bin/php[0-9]* 2>/dev/null' | grep '^/')
+        for cmd in "${cmds[@]}"; do
+          line="$(cexec "$rt" "$id" "$cmd" -v | grep -m1 '^PHP ')" || continue
+          full="$(awk '{print $2}' <<<"$line")"
+          up="$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$full")" || continue
+          [ -n "${seenv[$full]:-}" ] && continue
+          seenv[$full]=1
+          E_BRANCH+=("${up%.*}"); E_FULL+=("$full"); E_UP+=("$up"); E_KIND+=("container")
+          E_BIN+=("$rt: $name ($image)"); E_ORIGIN+=("$rt")
+          E_STATUS+=("$(php_status "$up" "${up%.*}")")
+          E_CTR+=("$id"); E_RT+=("$rt"); E_IMG+=("$image"); E_WD+=("$wd")
+        done
+        unset seenv
+      fi
+    done <<<"$out"
+  done
+}
+
+# Langkah perbaikan untuk container (tidak dijalankan otomatis).
+ctr_advice() {
+  local i shown=0 rt img wd tag
+  declare -A done_ctr=()
+  for i in "${!E_BRANCH[@]}"; do
+    [ -n "${E_CTR[$i]}" ] || continue
+    case "${E_STATUS[$i]}" in VULNERABLE|EOL) ;; *) continue ;; esac
+    [ "$shown" -eq 0 ] && { echo; info "Langkah untuk container (jalankan manual)"; shown=1; }
+    if [ "${E_STATUS[$i]}" = EOL ]; then warn "${E_BIN[$i]}: PHP ${E_FULL[$i]} — EOL"
+    else warn "${E_BIN[$i]}: PHP ${E_FULL[$i]} — RENTAN"; fi
+    if [ "${E_STATUS[$i]}" = EOL ]; then
+      printf '      %s
+' "Image memakai PHP ${E_BRANCH[$i]} (EOL): pull ulang TIDAK menolong, ganti tag image ke PHP 8.2+."         "Sementara: mount file ini ke conf.d PHP di container (mis. /usr/local/etc/php/conf.d/zz-mitigasi.ini):"         "  session.upload_progress.enabled = Off" "lalu buat ulang container."
+    else
+      printf '      %s
+' "Butuh PHP >= ${MIN_PATCHED[${E_BRANCH[$i]}]}. Pull image versi terbaru lalu buat ulang container."
+    fi
+    done_ctr["${E_CTR[$i]}"]="${E_RT[$i]}|${E_IMG[$i]}|${E_WD[$i]}"
+  done
+  for i in "${!X_BIN[@]}"; do
+    [ -n "${X_CTR[$i]}" ] || continue
+    [ "${X_STATUS[$i]}" = PATCHED ] && continue
+    [ "$shown" -eq 0 ] && { echo; info "Langkah untuk container (jalankan manual)"; shown=1; }
+    warn "${X_BIN[$i]}: ${X_FULL[$i]} — RENTAN (butuh nginx $NGX_FIX_STABLE / $NGX_FIX_MAINLINE)"
+    if [ "${X_KIND[$i]}" = container-openresty ]; then
+      printf '      %s
+' "Image berbasis OpenResty: tunggu/cek rilis image yang memuat fix nginx terbaru sebelum pull."         "Sementara: matikan HTTP/2 di konfigurasi proxy (mis. opsi \"HTTP/2 Support\" di Nginx Proxy Manager)."
+    fi
+    done_ctr["${X_CTR[$i]}"]="${X_RT[$i]}|${X_IMG[$i]}|${X_WD[$i]}"
+  done
+  [ "$shown" -eq 1 ] || return 0
+  echo; echo "  Cara memperbarui per container:"
+  for i in "${!done_ctr[@]}"; do
+    IFS='|' read -r rt img wd <<<"${done_ctr[$i]}"
+    tag="${img##*:}"; [ "$tag" = "$img" ] && tag="latest"
+    if [ -n "$wd" ]; then
+      printf '    %s
+' "# $img (compose di $wd)" "cd $wd && $rt compose pull && $rt compose up -d"
+    else
+      printf '    %s
+' "# $img (tanpa compose)" "$rt pull $img   # lalu buat ulang container dengan opsi yang sama"
+    fi
+    [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && printf '    %s
+' "# catatan: tag '$tag' dipin ke versi tertentu — ganti tag ke rilis yang sudah berisi fix."
+  done
+  echo
+  warn "Sebelum membuat ulang container: data yang TIDAK berada di volume/bind mount akan hilang."
+  warn "Cek dulu (hanya baca):  $rt inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}' <nama_container>"
+  warn "Pada Docker lama tanpa plugin compose, gunakan 'docker-compose' (pakai tanda hubung)."
+}
+
 # ------------------------------------------------------------- pilih item ----
 choose() { # $1 = php|ngx, sisanya indeks kandidat
   CHOSEN=()
@@ -624,6 +752,7 @@ main() {
       --all)            A_PHP_UPD=1; A_NGX_UPD=1; A_PHP_MIT=1; FROM_FLAG=1 ;;
       --skip-php)       SKIP_PHP=1 ;;
       --skip-nginx)     SKIP_NGX=1 ;;
+      --skip-containers) SKIP_CTR=1 ;;
       --yes|-y)         ASSUME_YES=1 ;;
       --no-restart)     DO_RESTART=0 ;;
       -h|--help)        usage; exit 0 ;;
@@ -633,23 +762,43 @@ main() {
   done
   [ "$CHECK_ONLY" -eq 1 ] && { A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; }
 
-  printf '%s\n\n' "${B}php-patch-check ${SCRIPT_VERSION}${N} ${D}— PHP ${PHP_RELEASE_DATE} · nginx ${NGX_ADVISORY}${N}"
+  printf '%s\n\n' "${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N} ${D}— PHP ${PHP_RELEASE_DATE} · nginx ${NGX_ADVISORY}${N}"
   [ "$(uname -s)" = Linux ] || { err "Script ini hanya untuk Linux."; exit 2; }
   detect_tty; detect_pkg
-  [ "$SKIP_PHP" -eq 0 ] && { php_discover; php_report; }
-  [ "$SKIP_NGX" -eq 0 ] && { ngx_discover; ngx_report; }
+  [ "$SKIP_PHP" -eq 0 ] && php_discover
+  [ "$SKIP_NGX" -eq 0 ] && ngx_discover
+  [ "$SKIP_CTR" -eq 0 ] && ctr_discover
+  [ "$SKIP_PHP" -eq 0 ] && php_report
+  [ "$SKIP_NGX" -eq 0 ] && ngx_report
 
-  local i php_upd=() php_mit=() ngx_vul=()
+  local i php_upd=() php_mit=() ngx_vul=() ctr_vul=0
+  if [ $(( ${#E_BRANCH[@]} + ${#X_BIN[@]} )) -eq 0 ]; then
+    warn "Tidak ada PHP maupun nginx yang bisa dicek (di host maupun container)."
+    [ "$CTR_DENIED" -eq 1 ] && warn "Container belum terbaca: ulangi dengan \"| sudo bash\"."
+    warn "Jika proxy memakai software lain (Caddy, Traefik, HAProxy), script ini tidak mencakupnya."
+    exit 0
+  fi
   for i in "${!E_BRANCH[@]}"; do
+    if [ -n "${E_CTR[$i]}" ]; then
+      case "${E_STATUS[$i]}" in VULNERABLE|EOL) ctr_vul=1 ;; esac
+      continue
+    fi
     case "${E_STATUS[$i]}" in
       VULNERABLE) php_upd+=("$i"); php_mit+=("$i") ;;
       EOL)        php_mit+=("$i"); [ "${E_ORIGIN[$i]}" = "repo distro" ] && php_upd+=("$i") ;;
     esac
   done
-  for i in "${!X_BIN[@]}"; do [ "${X_STATUS[$i]}" = PATCHED ] || ngx_vul+=("$i"); done
+  for i in "${!X_BIN[@]}"; do
+    [ "${X_STATUS[$i]}" = PATCHED ] && continue
+    if [ -n "${X_CTR[$i]}" ]; then ctr_vul=1; else ngx_vul+=("$i"); fi
+  done
 
   if [ "${#php_mit[@]}" -eq 0 ] && [ "${#ngx_vul[@]}" -eq 0 ]; then
+    if [ "$ctr_vul" -eq 1 ]; then
+      ctr_advice; exit 1
+    fi
     ok "Semua PHP dan nginx yang terdeteksi sudah berisi patch terbaru."
+    [ "$CTR_DENIED" -eq 1 ] && warn "Container belum terbaca: ulangi dengan \"| sudo bash\" untuk hasil lengkap."
     exit 0
   fi
 
@@ -684,6 +833,7 @@ main() {
     for i in "${CHOSEN[@]}"; do echo; php_update "$i"; done
     php_mit=()
     for i in "${!E_BRANCH[@]}"; do
+      [ -n "${E_CTR[$i]}" ] && continue
       local up; up="$("${E_BIN[$i]}" -v 2>/dev/null | head -n1 | awk '{print $2}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
       [ -n "$up" ] && E_STATUS[$i]="$(php_status "$up" "${E_BRANCH[$i]}")"
       case "${E_STATUS[$i]}" in VULNERABLE|EOL) php_mit+=("$i") ;; esac
@@ -704,6 +854,7 @@ main() {
     for i in "${CHOSEN[@]}"; do echo; ngx_update "$i"; done
     ngx_vul=()
     for i in "${!X_BIN[@]}"; do
+      [ -n "${X_CTR[$i]}" ] && continue
       local nu; nu="$("${X_BIN[$i]}" -v 2>&1 | grep -oE '/[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | tr -d /)"
       if [ -n "$nu" ] && [ "${X_STATUS[$i]}" != PLUS ]; then X_UP[$i]="$nu"; X_STATUS[$i]="$(ngx_status "$nu" 0)"; fi
       [ "${X_STATUS[$i]}" = PATCHED ] || ngx_vul+=("$i")
@@ -726,7 +877,8 @@ main() {
     ngx_advice
   fi
 
-  if [ "${#php_mit[@]}" -gt 0 ] || [ "${#ngx_vul[@]}" -gt 0 ]; then exit 1; fi
+  ctr_advice
+  if [ "${#php_mit[@]}" -gt 0 ] || [ "${#ngx_vul[@]}" -gt 0 ] || [ "$ctr_vul" -eq 1 ]; then exit 1; fi
   exit 0
 }
 
