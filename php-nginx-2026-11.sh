@@ -13,9 +13,9 @@
 #
 #  Pemakaian (pin ke tag/commit, jangan ke branch main):
 #    Laporan saja (tidak mengubah apa pun; sudo agar config & Docker terbaca):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.3.0/php-nginx-2026-11.sh | sudo bash -s -- --check
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.4.0/php-nginx-2026-11.sh | sudo bash -s -- --check
 #    Interaktif (menu):
-#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.3.0/php-nginx-2026-11.sh | sudo bash
+#      curl -fsSL https://raw.githubusercontent.com/anangai31/server-patch-kit/v1.4.0/php-nginx-2026-11.sh | sudo bash
 #    Non-interaktif:
 #      ... | sudo bash -s -- --update --mitigate --yes
 #
@@ -30,6 +30,7 @@
 #    --skip-php          Lewati semua bagian PHP
 #    --skip-nginx        Lewati semua bagian nginx
 #    --skip-containers   Jangan memeriksa container Docker/Podman
+#    --skip-cve          Lewati scan CVE per versi PHP
 #    --yes               Jawab "ya" untuk semua konfirmasi
 #    --no-restart        Jangan restart PHP-FPM / web server
 #    -h, --help          Bantuan
@@ -41,7 +42,7 @@
 #  nginx divalidasi dengan "nginx -t" dan dikembalikan bila gagal.
 # =============================================================================
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_NAME="server-patch-kit · php-nginx-2026-11"
 
 # ---- Acuan PHP (perbarui saat ada rilis baru) --------------------------------
@@ -66,7 +67,7 @@ START_HUMAN="$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%:z)')"
 # Backup disimpan di luar direktori konfigurasi, supaya tidak ikut ter-include
 # oleh pola seperti "include sites-enabled/*;" di nginx.
 BACKUP_DIR="/var/backups/php-patch-check/${TS}-$$"
-ASSUME_YES=0; DO_RESTART=1; FROM_FLAG=0; SKIP_PHP=0; SKIP_NGX=0; SKIP_CTR=0; CHECK_ONLY=0; CTR_DENIED=0
+ASSUME_YES=0; DO_RESTART=1; FROM_FLAG=0; SKIP_PHP=0; SKIP_NGX=0; SKIP_CTR=0; SKIP_CVE=0; CHECK_ONLY=0; CTR_DENIED=0
 A_PHP_UPD=0; A_PHP_MIT=0; A_NGX_UPD=0; A_NGX_H2=0; A_SYS=0
 php_upd=(); php_mit=(); ngx_vul=(); ctr_vul=0
 PKG=""; HAS_TTY=0
@@ -92,7 +93,7 @@ usage() {
   cat <<'EOF'
 server-patch-kit php-nginx-2026-11: cek PHP & nginx (host + container) terhadap advisory terbaru.
   --check  --update  --mitigate  --nginx-no-http2  --all  --system-upgrade
-  --skip-php  --skip-nginx  --skip-containers  --yes  --no-restart  -h|--help
+  --skip-php  --skip-nginx  --skip-containers  --skip-cve  --yes  --no-restart  -h|--help
 Contoh: curl -fsSL <URL> | sudo bash -s -- --update --mitigate --yes
 EOF
 }
@@ -422,6 +423,203 @@ php_mitigate() {
     warn "Mitigasi ini hanya mengurangi satu jalur serangan; PHP ${E_BRANCH[$i]} tetap tidak aman."
     warn "Rencanakan migrasi ke PHP 8.2+ (8.2 sendiri EOL 31 Des 2026)."
   fi
+}
+
+# =============================================================================
+#                     SCAN CVE PHP (versi yang belum di-patch)
+# =============================================================================
+# Daftar CVE: rilis darurat 21 Okt 2026 (PHP2Shell) dan rilis 19 Nov 2026.
+# Format: ID|tingkat|deskripsi|cabang_min|cabang_maks|fix(oct/nov)|pemeriksa
+declare -A OCT_FIX=( [8.2]="8.2.35" [8.3]="8.3.36" [8.4]="8.4.27" [8.5]="8.5.12" )
+CVE_DB=(
+  "CVE-2026-109618|KRITIS|RCE tanpa autentikasi (PHP2Shell)|8.2|8.5|oct|none"
+  "CVE-2026-109619|KRITIS|RCE tanpa autentikasi via session|8.2|8.5|oct|upload"
+  "CVE-2026-129289|KRITIS|PHP-FPM request smuggling|8.2|8.5|nov|keepconn"
+  "CVE-2026-115560|KRITIS|Session upload progress -> unserialize|8.2|8.5|nov|upload"
+  "CVE-2026-126714|KRITIS|Penulisan session terputus -> unserialize|8.2|8.5|nov|savehandler"
+  "CVE-2026-129496|KRITIS|Ekstensi date: use-after-free|8.2|8.5|nov|startupwarn"
+  "CVE-2026-129481|KRITIS|Session shutdown: use-after-free|8.3|8.5|nov|none"
+  "CVE-2026-129182|KRITIS|Engine (backtrace): use-after-free|8.5|8.5|nov|backtrace"
+  "CVE-2026-129474|KRITIS|Engine (__call backtrace): use-after-free|8.5|8.5|nov|ignoreargs"
+  "CVE-2026-129291|TINGGI|PHP-FPM master: perintah sebagai root|8.2|8.5|nov|catchworkers"
+)
+
+is_on() { case "${1,,}" in on|1|true|yes) return 0 ;; *) return 1 ;; esac; }
+ini_val() { awk -F' => ' -v k="$2" '$1==k {print $2; exit}' <<<"$1"; }
+
+pool_dir_for() {
+  local i="$1" br="${E_BRANCH[$1]}" nd="${E_BRANCH[$1]/./}"
+  case "${E_KIND[$i]}" in
+    deb)    echo "/etc/php/$br/fpm/pool.d" ;;
+    remi)   echo "/etc/opt/remi/php${nd}/php-fpm.d" ;;
+    cpanel) echo "/opt/cpanel/ea-php${nd}/root/etc/php-fpm.d" ;;
+    plesk)  echo "/opt/plesk/php/${br}/etc/php-fpm.d" ;;
+    rpm)    echo "/etc/php-fpm.d" ;;
+  esac
+}
+
+pool_vals() { # file/dir key → semua nilai php_value/php_admin_value/flag[key]
+  [ -e "$1" ] || return 0
+  local k="${2//./\\.}"
+  grep -rhE "^[[:space:]]*php_(admin_)?(value|flag)\[$k\][[:space:]]*=" "$1" 2>/dev/null \
+    | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/[[:space:]";]*$//'
+}
+
+# Kumpulkan konfigurasi efektif satu versi PHP (hanya membaca).
+php_ctx() {
+  local i="$1" bin d pd v f gsp gh ph psp
+  bin="$(fpm_bin_for "$i")"; { [ -n "$bin" ] && [ -x "$bin" ]; } || bin="${E_BIN[$i]}"
+  C_SAPI="$(basename "$bin")"
+  d="$("$bin" -i 2>/dev/null)"
+  pd="$(pool_dir_for "$i")"
+  C_UPLOAD=off; is_on "$(ini_val "$d" session.upload_progress.enabled)" && C_UPLOAD=on
+  C_UPLOAD_POOL=""; for v in $(pool_vals "$pd" session.upload_progress.enabled); do is_on "$v" && C_UPLOAD_POOL=on; done
+  C_SAVEH="$(ini_val "$d" session.save_handler)"
+  C_ERRLOG="$(ini_val "$d" error_log)"
+  C_IGN="$(ini_val "$d" zend.exception_ignore_args)"
+  for v in $(pool_vals "$pd" zend.exception_ignore_args); do is_on "$v" || C_IGN=Off; done
+  C_FEBT="$(ini_val "$d" fatal_error_backtraces)"
+  for v in $(pool_vals "$pd" fatal_error_backtraces); do is_on "$v" && C_FEBT=On; done
+  C_WARN="$("$bin" -d display_startup_errors=1 -d log_errors=0 -i 2>&1 | grep -m3 -E '^(PHP )?(Warning|Deprecated|Notice):')"
+  C_CATCH=0
+  [ -n "$pd" ] && grep -rqsE '^[[:space:]]*catch_workers_output[[:space:]]*=[[:space:]]*yes' "$(dirname "$pd")" && C_CATCH=1
+  # Peta save_path → serialize_handler (untuk deteksi beda format session)
+  gsp="$(ini_val "$d" session.save_path)"; gh="$(ini_val "$d" session.serialize_handler)"
+  if [ -d "$pd" ]; then
+    for f in "$pd"/*.conf; do
+      [ -f "$f" ] || continue
+      ph="$(pool_vals "$f" session.serialize_handler | tail -n1)"
+      psp="$(pool_vals "$f" session.save_path | tail -n1)"
+      SER_MAP["${psp:-$gsp}"]+="${ph:-$gh}@PHP${E_BRANCH[$i]}:$(basename "$f") "
+    done
+  else
+    SER_MAP["$gsp"]+="${gh}@PHP${E_BRANCH[$i]} "
+  fi
+}
+
+errlog_is_file() { [ -n "$C_ERRLOG" ] && [ "$C_ERRLOG" != "no value" ] && [ "$C_ERRLOG" != "syslog" ]; }
+
+detect_keepconn() {
+  local i
+  KEEPCONN=""; LSAPI=0
+  for i in "${!X_BIN[@]}"; do
+    [ -n "${X_CTR[$i]}" ] && continue
+    ngx_conf_dump "${X_BIN[$i]}" | grep -Eq '(^|[[:space:];{])fastcgi_keep_conn[[:space:]]+on' \
+      && KEEPCONN="nginx: fastcgi_keep_conn on"
+  done
+  grep -rqsiE 'enablereuse=on' /etc/apache2 /etc/httpd 2>/dev/null \
+    && KEEPCONN="${KEEPCONN:+$KEEPCONN, }Apache: enablereuse=on"
+  { [ -d /usr/local/lsws ] || pgrep -x litespeed >/dev/null 2>&1; } && LSAPI=1
+}
+
+cve_eval() { # pemeriksa → "STATUS|alasan"
+  case "$1" in
+    upload)
+      if   [ "$C_UPLOAD_POOL" = on ]; then echo "TERPAPAR|ada pool FPM yang menyalakan upload_progress"
+      elif [ "$C_UPLOAD" = on ];      then echo "TERPAPAR|session.upload_progress.enabled = On"
+      else echo "DIMITIGASI|upload_progress Off (hanya jalur upload progress)"; fi ;;
+    keepconn)
+      if   [ -n "$KEEPCONN" ]; then echo "TERPAPAR|$KEEPCONN"
+      elif [ "$LSAPI" -eq 1 ]; then echo "TERBUKA|LiteSpeed LSAPI terdeteksi"
+      else echo "TIDAK TERPAPAR|koneksi FastCGI tidak dipakai ulang"; fi ;;
+    savehandler)
+      if [ "$C_SAVEH" = files ]; then echo "TERBUKA|save_handler=files; berisiko bila aplikasi menyimpan input user di \$_SESSION"
+      else echo "TIDAK TERPAPAR|save_handler=${C_SAVEH:-?} (bukan files)"; fi ;;
+    startupwarn)
+      if [ -n "$C_WARN" ] && errlog_is_file; then echo "TERPAPAR|ada warning saat startup dan error_log ke file"
+      elif [ -n "$C_WARN" ]; then echo "TIDAK TERPAPAR|ada warning startup, tapi error_log bukan file"
+      else echo "TIDAK TERPAPAR|tidak ada warning saat startup"; fi ;;
+    backtrace)
+      if is_on "$C_FEBT"; then echo "TERBUKA|fatal_error_backtraces On (default 8.5)"
+      else echo "DIMITIGASI|fatal_error_backtraces Off"; fi ;;
+    ignoreargs)
+      if ! is_on "$C_FEBT"; then echo "DIMITIGASI|fatal_error_backtraces Off"
+      elif is_on "$C_IGN"; then echo "DIMITIGASI|zend.exception_ignore_args On"
+      else echo "TERBUKA|zend.exception_ignore_args Off"; fi ;;
+    catchworkers)
+      if [ "$C_CATCH" -eq 1 ]; then echo "TERPAPAR|catch_workers_output = yes di konfigurasi FPM"
+      else echo "TIDAK TERPAPAR|catch_workers_output tidak aktif"; fi ;;
+    *) echo "TERBUKA|tidak ada mitigasi lewat konfigurasi; hanya update" ;;
+  esac
+}
+
+cve_line() { # id tingkat deskripsi "STATUS|alasan"
+  local st="${4%%|*}" why="${4#*|}" col
+  case "$st" in
+    TERPAPAR)         col="${R}TERPAPAR${N}";        CNT_EXP=$((CNT_EXP+1)) ;;
+    TERBUKA)          col="${Y}TERBUKA${N}";         CNT_OPEN=$((CNT_OPEN+1)) ;;
+    DIMITIGASI)       col="${G}DIMITIGASI${N}" ;;
+    "TIDAK TERPAPAR") col="${G}TIDAK TERPAPAR${N}" ;;
+  esac
+  printf '    %-16s %-7s %-42s %s %s\n' "$1" "$2" "$3" "$col" "${D}($why)${N}"
+}
+
+php_cve_report() {
+  local i e id sev desc lo hi fx chk fixv shown=0 k list n
+  declare -gA SER_MAP=()
+  CNT_EXP=0; CNT_OPEN=0
+  detect_keepconn
+  for i in "${!E_BRANCH[@]}"; do
+    case "${E_STATUS[$i]}" in VULNERABLE|EOL) ;; *) continue ;; esac
+    [ "$shown" -eq 0 ] && { info "Scan CVE PHP (versi yang belum di-patch)"; shown=1; }
+
+    if [ -n "${E_CTR[$i]}" ]; then   # container: berdasarkan versi saja
+      list=""
+      for e in "${CVE_DB[@]}"; do
+        IFS='|' read -r id sev desc lo hi fx chk <<<"$e"
+        version_ge "${E_BRANCH[$i]}" "$lo" && version_ge "$hi" "${E_BRANCH[$i]}" || continue
+        if [ "$fx" = oct ]; then fixv="${OCT_FIX[${E_BRANCH[$i]}]}"; else fixv="${MIN_PATCHED[${E_BRANCH[$i]}]}"; fi
+        version_ge "${E_UP[$i]}" "$fixv" && continue
+        list+="${id#CVE-} "
+      done
+      printf '  %s\n' "${B}PHP ${E_FULL[$i]}${N} — ${E_BIN[$i]}"
+      if [ "${E_STATUS[$i]}" = EOL ]; then
+        printf '    %s\n' "EOL: tidak ada patch; minimal terdampak CVE-2026-115560 dan -129289. Ganti base image ke PHP 8.2+."
+      else
+        printf '    %s\n' "Belum di-patch (berdasarkan versi): CVE-2026-${list// /, CVE-2026-}" | sed 's/, CVE-2026-$//'
+        printf '    %s\n' "${D}Konfigurasi di dalam container tidak dievaluasi; solusinya build ulang image.${N}"
+      fi
+      echo; continue
+    fi
+
+    php_ctx "$i"
+    if [ "${E_STATUS[$i]}" = EOL ]; then
+      printf '  %s\n' "${B}PHP ${E_FULL[$i]}${N} ${D}(${C_SAPI})${N} — ${R}EOL, tidak ada patch upstream${N}"
+      cve_line "CVE-2026-115560" "KRITIS" "Session upload progress (terbukti s/d 5.4)" "$(cve_eval upload)"
+      cve_line "CVE-2026-129289" "KRITIS" "FPM request smuggling (perilaku sejak 5.6)" "$(cve_eval keepconn)"
+      printf '    %s\n' "${D}CVE lain dari rilis Okt/Nov tidak dievaluasi upstream untuk versi EOL — anggap rentan.${N}"
+    else
+      printf '  %s\n' "${B}PHP ${E_FULL[$i]}${N} ${D}(${C_SAPI})${N}"
+      n=0
+      for e in "${CVE_DB[@]}"; do
+        IFS='|' read -r id sev desc lo hi fx chk <<<"$e"
+        version_ge "${E_BRANCH[$i]}" "$lo" && version_ge "$hi" "${E_BRANCH[$i]}" || continue
+        if [ "$fx" = oct ]; then fixv="${OCT_FIX[${E_BRANCH[$i]}]}"; else fixv="${MIN_PATCHED[${E_BRANCH[$i]}]}"; fi
+        version_ge "${E_UP[$i]}" "$fixv" && continue
+        cve_line "$id" "$sev" "$desc" "$(cve_eval "$chk")"; n=$((n+1))
+      done
+      [ "$n" -eq 0 ] && printf '    %s\n' "Tidak ada CVE dari daftar yang berlaku."
+    fi
+    if [ -n "$C_WARN" ]; then
+      printf '    %s\n' "${Y}Warning saat startup (perbaiki, lalu restart FPM):${N}"
+      sed 's/^/      /' <<<"$C_WARN"
+    fi
+    echo
+  done
+  [ "$shown" -eq 1 ] || return 0
+
+  for k in "${!SER_MAP[@]}"; do
+    n="$(tr ' ' '\n' <<<"${SER_MAP[$k]}" | sed 's/@.*//' | grep . | sort -u | wc -l)"
+    if [ "$n" -gt 1 ]; then
+      warn "session.save_path '${k:-default}' dipakai bersama dengan serialize_handler berbeda:"
+      printf '      %s\n' ${SER_MAP[$k]}
+      warn "Kombinasi ini adalah syarat eksploitasi CVE-2026-115560; samakan handler atau pisahkan save_path."
+    fi
+  done
+  printf '  %s\n' "${D}Keterangan: TERPAPAR = konfigurasi memicu celah · TERBUKA = tidak bisa ditutup lewat konfigurasi${N}"
+  printf '  %s\n' "${D}DIMITIGASI/TIDAK TERPAPAR = jalur yang diketahui tertutup. Status versi tetap RENTAN sampai di-update.${N}"
+  [ "$(id -u)" -ne 0 ] && warn "Bukan root: sebagian konfigurasi pool FPM mungkin tidak terbaca."
+  echo
 }
 
 # =============================================================================
@@ -874,6 +1072,7 @@ main() {
       --skip-php)       SKIP_PHP=1 ;;
       --skip-nginx)     SKIP_NGX=1 ;;
       --skip-containers) SKIP_CTR=1 ;;
+      --skip-cve)       SKIP_CVE=1 ;;
       --yes|-y)         ASSUME_YES=1 ;;
       --no-restart)     DO_RESTART=0 ;;
       -h|--help)        usage; exit 0 ;;
@@ -892,6 +1091,7 @@ main() {
   [ "$SKIP_NGX" -eq 0 ] && ngx_discover
   [ "$SKIP_CTR" -eq 0 ] && ctr_discover
   [ "$SKIP_PHP" -eq 0 ] && php_report
+  [ "$SKIP_PHP" -eq 0 ] && [ "$SKIP_CVE" -eq 0 ] && php_cve_report
   [ "$SKIP_NGX" -eq 0 ] && ngx_report
 
   local i tok
